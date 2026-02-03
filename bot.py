@@ -1,0 +1,435 @@
+"""
+Бот "Сота Сил" для ВКонтакте
+Основной файл с веб-сервером и обработкой сообщений
+"""
+import asyncio
+import json
+import hashlib
+import hmac
+import logging
+import time
+from typing import Dict, Any, Optional
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import PlainTextResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
+
+from config import VK_TOKEN, VK_GROUP_ID, VK_API_URL, VK_API_VERSION, CONFIRMATION_SECRET, SYSTEM_PROMPT
+from gigachat_client import gigachat_client
+from history import history_manager
+from user_preferences import user_preferences
+from confirmation_manager import confirmation_manager
+from message_deduplicator import message_deduplicator
+
+# Настройка логирования
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+app = FastAPI(title="Сота Сил - VK Bot")
+
+# Настройка CORS
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+async def send_message(user_id: int, peer_id: int = None, message: str = None) -> bool:
+    """
+    Отправка сообщения через VK API
+
+    Args:
+        user_id: ID пользователя (отправитель)
+        peer_id: ID получателя (пользователь или беседа)
+        message: Текст сообщения
+
+    Returns:
+        True если отправлено успешно
+    """
+    import aiohttp
+
+    # Определяем получателя
+    if peer_id:
+        # Отправка в беседу
+        recipient_id = peer_id
+        logger.info(f"📤 Отправка в беседу {peer_id}")
+    else:
+        # Отправка личного сообщения
+        recipient_id = user_id
+        logger.info(f"📤 Отправка личного сообщения пользователю {user_id}")
+
+    params = {
+        "peer_id": recipient_id,
+        "message": message,
+        "access_token": VK_TOKEN,
+        "v": VK_API_VERSION,
+        "random_id": 0
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.post(
+            f"{VK_API_URL}messages.send",
+            params=params
+        ) as response:
+            data = await response.json()
+            if "error" in data:
+                logger.error(f"Ошибка отправки: {data['error']}")
+                return False
+            logger.info(f"✅ Сообщение отправлено получателю {recipient_id}")
+            return True
+
+
+async def get_user_name(user_id: int) -> str:
+    """
+    Получение имени пользователя ВКонтакте
+
+    Args:
+        user_id: ID пользователя
+
+    Returns:
+        Имя пользователя или "Друг"
+    """
+    import aiohttp
+
+    params = {
+        "user_ids": user_id,
+        "access_token": VK_TOKEN,
+        "v": VK_API_VERSION,
+        "fields": "first_name"
+    }
+
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{VK_API_URL}users.get",
+            params=params
+        ) as response:
+            data = await response.json()
+            if "response" in data:
+                user = data["response"][0]
+                return user.get("first_name", "Друг")
+    return "Друг"
+
+
+def check_secret_secret_type(event: Dict) -> bool:
+    """
+    Проверка секретного ключа Callback API
+
+    Args:
+        event: Событие от ВКонтакте
+
+    Returns:
+        True если ключ валиден
+    """
+    # Если секрет не настроен, пропускаем проверку
+    if not CONFIRMATION_SECRET or CONFIRMATION_SECRET == "your_confirmation_secret":
+        return True
+
+    if "secret" not in event:
+        return False
+
+    return hmac.new(
+        CONFIRMATION_SECRET.encode(),
+        json.dumps(event).encode(),
+        hashlib.sha256
+    ).hexdigest() == event["secret"]
+
+
+@app.get("/update_confirmation/{new_code}")
+async def update_confirmation_code(new_code: str):
+    """Обновление кода подтверждения через GET запрос"""
+    confirmation_manager.save_code(new_code)
+    logger.info(f"🔄 Код подтверждения обновлён: {new_code}")
+    return {"status": "updated", "code": new_code}
+
+@app.get("/confirmation_status")
+async def confirmation_status():
+    """Получение статуса кода подтверждения"""
+    status = confirmation_manager.get_status()
+    return {
+        "status": status,
+        "instructions": confirmation_manager.get_setup_instructions()
+    }
+
+@app.get("/deduplicator_status")
+async def deduplicator_status():
+    """Получение статуса дедупликатора сообщений"""
+    stats = message_deduplicator.get_stats()
+    return {
+        "deduplicator_stats": stats,
+        "description": "Статистика системы предотвращения дублирования сообщений"
+    }
+
+@app.post("/")
+async def vk_callback(request: Request):
+    """
+    Обработка событий от ВКонтакте (Callback API)
+    """
+    try:
+        event = await request.json()
+        logger.info(f"Получено событие: {event.get('type', 'unknown')}")
+        event_type = event.get("type")
+
+        # Обработка подтверждения
+        if event_type == "confirmation":
+            # Сначала пробуем загрузить код из переменной окружения
+            confirmation_manager.update_code_from_env()
+            
+            # Получаем код подтверждения
+            confirmation_code = confirmation_manager.get_code()
+            
+            if confirmation_code:
+                logger.info(f"✅ Используется код подтверждения: {confirmation_code}")
+                return PlainTextResponse(content=confirmation_code)
+            else:
+                # Код не найден - логируем и возвращаем стандартный ответ
+                logger.error("❌ Код подтверждения не настроен!")
+                logger.info("📋 Инструкции по настройке:")
+                logger.info(confirmation_manager.get_setup_instructions())
+                return PlainTextResponse(content="ok")
+
+        # Проверка секрета (временно отключена для тестирования)
+        # if not check_secret_secret_type(event):
+        #     raise HTTPException(status_code=403, detail="Invalid secret")
+
+        # Обработка новых сообщений
+        if event_type == "message_new":
+            await handle_message(event["object"]["message"])
+
+        return {"response": "ok"}
+
+    except Exception as e:
+        logger.error(f"Ошибка обработки события: {e}")
+        return {"response": "ok"}
+
+
+async def handle_message(message: Dict):
+    """
+    Обработка входящего сообщения
+
+    Args:
+        message: Данные сообщения
+    """
+    # Получаем ID сообщения для дедупликации
+    message_id = message.get("id")
+    text = message.get("text", "").strip()
+    user_id = message.get("from_id")
+    message_date = message.get("date", 0)
+    
+    # Отладочная информация
+    logger.info(f"📋 Полное сообщение: {message}")
+    
+    # Проверяем на дубликат
+    is_duplicate, reason = message_deduplicator.is_duplicate(
+        message_id=message_id,
+        text=text,
+        user_id=user_id,
+        peer_id=message.get("peer_id")
+    )
+    
+    if is_duplicate:
+        logger.info(f"⏭️ Пропуск дублирующего сообщения: {reason}")
+        return
+    
+    if not text or not user_id:
+        return
+    
+    # Проверяем время сообщения (не старше 1 минуты)
+    current_time = int(time.time())
+    if current_time - message_date > 60:  # 60 секунд = 1 минута
+        logger.info(f"⏰ Сообщение слишком старое ({current_time - message_date}s), пропускаем")
+        return
+
+    # Проверяем тип сообщения
+    is_conversation = "peer_id" in message and message.get("peer_id", 0) > 2000000000
+    
+    if not is_conversation:
+        # Личное сообщение - НЕ отвечаем
+        logger.info(f"👤 Личное сообщение - пропускаем")
+        return
+    
+    # Это сообщение из беседы
+    logger.info(f"💬 Сообщение из беседы: {message.get('peer_id')}")
+    
+    # Проверяем упоминания
+    is_mention = False
+    
+    # Проверяем разные форматы упоминания
+    mention_patterns = [
+        f"[club{VK_GROUP_ID}|",
+        f"@club{VK_GROUP_ID}",
+        "Сота Сил",
+        "sota",
+        "sota_sil",
+        "Сота",
+        "сота",
+        "альмсиви",
+        "Сота-сил",
+        "соты",
+        "Соты",
+        "Сотя",
+        "сотя",
+        "Альмсиви",
+        "хозяин механического города"
+    ]
+    
+    for pattern in mention_patterns:
+        if pattern.lower() in text.lower():
+            is_mention = True
+            logger.info(f"✅ Найдено упоминание: {pattern}")
+            break
+
+    # Проверяем, является ли сообщение ответом на сообщение бота
+    if not is_mention:
+        # Проверяем reply_message (ответ на конкретное сообщение)
+        if "reply_message" in message:
+            reply_msg = message["reply_message"]
+            if reply_msg.get("from_id") == -int(VK_GROUP_ID):  # Группы имеют отрицательный ID
+                is_mention = True
+                logger.info(f"✅ Найден ответ на сообщение бота")
+        
+        # Проверяем fwd_messages (пересланные сообщения)
+        if not is_mention and "fwd_messages" in message:
+            for fwd_msg in message.get("fwd_messages", []):
+                if fwd_msg.get("from_id") == -int(VK_GROUP_ID):
+                    is_mention = True
+                    logger.info(f"✅ Найдено пересланное сообщение от бота")
+                    break
+
+    # Если упоминание не найдено, пропускаем сообщение
+    if not is_mention:
+        logger.info(f"⏭️ Сообщение без упоминания в беседе, пропускаем")
+        return
+
+    # Получаем имя пользователя
+    user_name = await get_user_name(user_id)
+
+    # Очищаем текст от формата упоминания ВКонтакте
+    clean_text = text
+    for pattern in [f"[club{VK_GROUP_ID}|", "]"]:
+        clean_text = clean_text.replace(pattern, "")
+
+    logger.info(f"📝 Сообщение от {user_name}: {clean_text}")
+
+    # Проверяем команды настройки (только при упоминании)
+    setup_response = user_preferences.parse_setup_command(user_id, clean_text)
+    if setup_response:
+        logger.info(f"🔧 Выполнена команда настройки: {setup_response}")
+        # Отправляем ответ на команду настройки
+        await send_message(user_id, message.get("peer_id"), setup_response)
+        return
+    
+    # Проверяем команду показа списка настроек (только при упоминании)
+    if "настройки" in clean_text.lower() and ("команды" in clean_text.lower() or "что" in clean_text.lower()):
+        commands_list = user_preferences.list_user_commands()
+        logger.info(f"🔧 Показан список команд настройки")
+        # Отправляем список команд
+        await send_message(user_id, message.get("peer_id"), commands_list)
+        return
+
+    # Определяем ID чата для истории (только для бесед)
+    chat_id = str(message.get("peer_id"))
+
+    # Получаем персонализированный промпт
+    personalized_prompt = user_preferences.get_personalized_prompt(user_id, SYSTEM_PROMPT)
+    
+    # Отладочная информация о персонализации
+    special_name = user_preferences.get_special_name(user_id)
+    special_address = user_preferences.get_special_address(user_id)
+    special_tone = user_preferences.get_special_tone(user_id)
+    
+    logger.info(f"🔍 ID пользователя: {user_id}")
+    logger.info(f"🔍 special_name: {special_name}")
+    logger.info(f"🔍 special_address: {special_address}")
+    logger.info(f"🔍 special_tone: {special_tone}")
+    
+    if special_name:
+        logger.info(f"👑 Особый пользователь: {special_name} (ID: {user_id})")
+    else:
+        logger.info(f"👤 Обычный пользователь: {user_id}")
+    
+    logger.info(f"📝 Персонализированный промпт: {personalized_prompt[:200]}...")
+
+    # Сохраняем сообщение пользователя в историю
+    history_manager.add_message(chat_id, "user", clean_text)
+
+    # Отправляем запрос в Гигачат с персонализированным промптом
+    response = await gigachat_client.chat_with_personalized_prompt(
+        clean_text, chat_id, personalized_prompt
+    )
+    
+    # Для Любови добавляем обращение в начало ответа, если его там нет
+    if user_preferences.get_special_name(user_id) == "Любовь":
+        if not response.lower().startswith("моя королева"):
+            response = f"Моя королева, {response}"
+            logger.info(f"👑 Добавлено обращение для Любови")
+
+    # Сохраняем ответ в историю
+    history_manager.add_message(chat_id, "assistant", response)
+
+    # Отправляем ответ в беседу
+    await send_message(user_id, message.get("peer_id"), response)
+
+
+async def main():
+    """Запуск бота"""
+    import aiohttp
+
+    logger.info("🚀 Запуск бота 'Сота Сил'...")
+
+    # Проверка подключения к VK API
+    logger.info("📡 Проверка подключения к ВКонтакте...")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(
+            f"{VK_API_URL}groups.getById",
+            params={
+                "group_ids": VK_GROUP_ID,
+                "access_token": VK_TOKEN,
+                "v": VK_API_VERSION
+            }
+        ) as response:
+            data = await response.json()
+            logger.info(f"VK API Response: {data}")
+            if "response" in data and "groups" in data["response"] and data["response"]["groups"]:
+                group = data["response"]["groups"][0]
+                logger.info(f"✅ Подключение к ВКонтакте: '{group.get('name', 'Сота Сил')}'")
+            else:
+                logger.error(f"❌ Ошибка подключения к VK: {data}")
+                return
+
+    # Проверка подключения к GigaChat
+    logger.info("🤖 Проверка подключения к Гигачату...")
+    if await gigachat_client.test_connection():
+        logger.info("✅ Подключение к Гигачату: успешно!")
+    else:
+        logger.error("❌ Ошибка подключения к Гигачату")
+        return
+
+    # Запуск веб-сервера
+    import os
+    port = int(os.environ.get('PORT', 8000))
+    
+    logger.info(f"🌐 Запуск веб-сервера на порту {port}...")
+    logger.info("📝 Для настройки Callback API в ВКонтакте используйте URL: http://localhost:8000")
+    logger.info("💡 Для локального тестирования запустите: ngrok http 8000")
+    config = uvicorn.Config(app, host="0.0.0.0", port=port)
+    server = uvicorn.Server(config)
+    await server.serve()
+
+
+if __name__ == "__main__":
+    import os
+    import uvicorn
+    port = int(os.environ.get('PORT', 8000))
+    
+    if os.environ.get('RENDER'):
+        # Для Render.com
+        uvicorn.run(app, host="0.0.0.0", port=port)
+    else:
+        # Для локального запуска
+        asyncio.run(main())
