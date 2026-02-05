@@ -45,14 +45,12 @@ class MessageDeduplicator:
         
         # Сначала проверяем по ID сообщения (наиболее надёжный способ)
         if message_id and message_id in self.processed_messages:
-            logger.info(f"🔄 Обнаружен дубликат по ID: {message_id}")
             return True, f"duplicate_id_{message_id}"
         
         # Если ID недоступен, проверяем по хешу содержимого
         if text and user_id and peer_id:
             content_hash = self._generate_content_hash(text, user_id, peer_id)
             if content_hash in self.processed_hashes:
-                logger.info(f"🔄 Обнаружен дубликат по содержимому: {content_hash[:8]}...")
                 return True, f"duplicate_content_{content_hash[:8]}"
             
             # Добавляем хеш в обработанные
@@ -61,7 +59,6 @@ class MessageDeduplicator:
         # Добавляем ID в обработанные (если есть)
         if message_id:
             self.processed_messages[message_id] = current_time
-            logger.info(f"✅ Сообщение ID: {message_id} добавлено в обработанные")
         
         return False, "new_message"
     

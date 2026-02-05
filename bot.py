@@ -21,13 +21,30 @@ from history import history_manager
 from user_preferences import user_preferences
 from confirmation_manager import confirmation_manager
 from message_deduplicator import message_deduplicator
+from hostile_responses import hostile_response_manager
+from random_comments import random_comments_manager
+
+def safe_log_message(message: str, max_length: int = 100) -> str:
+    """Безопасное логирование сообщений (обрезка длинных URL и текстов)"""
+    if len(message) > max_length:
+        return message[:max_length] + "..."
+    return message
 
 # Настройка логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(),
+        logging.FileHandler('bot.log', encoding='utf-8')
+    ]
 )
 logger = logging.getLogger(__name__)
+
+# Отключаем verbose логи от HTTP библиотек
+logging.getLogger("uvicorn").setLevel(logging.WARNING)
+logging.getLogger("aiohttp").setLevel(logging.WARNING)
+logging.getLogger("fastapi").setLevel(logging.WARNING)
 
 app = FastAPI(title="Сота Сил - VK Bot")
 
@@ -165,6 +182,24 @@ async def deduplicator_status():
         "description": "Статистика системы предотвращения дублирования сообщений"
     }
 
+@app.get("/hostile_responses_status")
+async def hostile_responses_status():
+    """Получение статуса системы резких ответов"""
+    stats = hostile_response_manager.get_stats()
+    return {
+        "hostile_responses_stats": stats,
+        "description": "Статистика системы резких ответов на негативные сообщения"
+    }
+
+@app.get("/random_comments_status")
+async def random_comments_status():
+    """Получение статуса системы случайных комментариев"""
+    stats = random_comments_manager.get_stats()
+    return {
+        "random_comments_stats": stats,
+        "description": "Статистика системы случайных комментариев без упоминаний"
+    }
+
 @app.post("/")
 async def vk_callback(request: Request):
     """
@@ -220,20 +255,18 @@ async def handle_message(message: Dict):
     text = message.get("text", "").strip()
     user_id = message.get("from_id")
     message_date = message.get("date", 0)
-    
-    # Отладочная информация
-    logger.info(f"📋 Полное сообщение: {message}")
+    peer_id = message.get("peer_id")
     
     # Проверяем на дубликат
     is_duplicate, reason = message_deduplicator.is_duplicate(
         message_id=message_id,
         text=text,
         user_id=user_id,
-        peer_id=message.get("peer_id")
+        peer_id=peer_id
     )
     
     if is_duplicate:
-        logger.info(f"⏭️ Пропуск дублирующего сообщения: {reason}")
+        logger.info(f"⏭️ Дубликат: {reason}")
         return
     
     if not text or not user_id:
@@ -242,7 +275,7 @@ async def handle_message(message: Dict):
     # Проверяем время сообщения (не старше 1 минуты)
     current_time = int(time.time())
     if current_time - message_date > 60:  # 60 секунд = 1 минута
-        logger.info(f"⏰ Сообщение слишком старое ({current_time - message_date}s), пропускаем")
+        logger.info(f"⏰ Старое сообщение ({current_time - message_date}s), пропускаем")
         return
 
     # Проверяем тип сообщения
@@ -255,6 +288,11 @@ async def handle_message(message: Dict):
     
     # Это сообщение из беседы
     logger.info(f"💬 Сообщение из беседы: {message.get('peer_id')}")
+    
+    # Очищаем текст от формата упоминания ВКонтакте (делаем сразу, чтобы использовать везде)
+    clean_text = text
+    for pattern in [f"[club{VK_GROUP_ID}|", "]"]:
+        clean_text = clean_text.replace(pattern, "")
     
     # Проверяем упоминания
     is_mention = False
@@ -301,18 +339,27 @@ async def handle_message(message: Dict):
                     logger.info(f"✅ Найдено пересланное сообщение от бота")
                     break
 
-    # Если упоминание не найдено, пропускаем сообщение
+    # Если упоминание не найдено, проверяем на случайные комментарии
     if not is_mention:
-        logger.info(f"⏭️ Сообщение без упоминания в беседе, пропускаем")
+        logger.info(f"⏭️ Сообщение без упоминания в беседе, проверяем случайные комментарии...")
+        
+        # Проверяем, стоит ли оставить случайный комментарий
+        if random_comments_manager.should_comment(clean_text):
+            logger.info(f"💬 Генерируем случайный комментарий для сообщения: {clean_text[:50]}...")
+            random_comment = random_comments_manager.generate_comment(clean_text)
+            
+            if random_comment:
+                logger.info(f"🎲 Случайный комментарий: {random_comment}")
+                # Отправляем случайный комментарий в беседу
+                await send_message(user_id, message.get("peer_id"), random_comment)
+                return
+        
+        # Если нет случайного комментария, полностью пропускаем сообщение
+        logger.info(f"⏭️ Сообщение без упоминания, случайный комментарий не требуется")
         return
 
     # Получаем имя пользователя
     user_name = await get_user_name(user_id)
-
-    # Очищаем текст от формата упоминания ВКонтакте
-    clean_text = text
-    for pattern in [f"[club{VK_GROUP_ID}|", "]"]:
-        clean_text = clean_text.replace(pattern, "")
 
     logger.info(f"📝 Сообщение от {user_name}: {clean_text}")
 
@@ -332,28 +379,30 @@ async def handle_message(message: Dict):
         await send_message(user_id, message.get("peer_id"), commands_list)
         return
 
+    # Проверяем на агрессивные сообщения
+    if hostile_response_manager.is_aggressive_message(clean_text):
+        logger.info(f"⚠️ Обнаружено агрессивное сообщение от {user_name}")
+        harsh_response = hostile_response_manager.generate_harsh_response()
+        if harsh_response:
+            logger.info(f"💢 Ответ с агрессией: {harsh_response[:50]}...")
+            await send_message(user_id, message.get("peer_id"), harsh_response)
+            return
+        else:
+            logger.info(f"⏰ Агрессивный ответ отклонён (кулдаун)")
+            # Можно отправить нейтральный ответ или пропустить
+
     # Определяем ID чата для истории (только для бесед)
     chat_id = str(message.get("peer_id"))
 
     # Получаем персонализированный промпт
     personalized_prompt = user_preferences.get_personalized_prompt(user_id, SYSTEM_PROMPT)
     
-    # Отладочная информация о персонализации
+    # Краткая информация о персонализации
     special_name = user_preferences.get_special_name(user_id)
-    special_address = user_preferences.get_special_address(user_id)
-    special_tone = user_preferences.get_special_tone(user_id)
-    
-    logger.info(f"🔍 ID пользователя: {user_id}")
-    logger.info(f"🔍 special_name: {special_name}")
-    logger.info(f"🔍 special_address: {special_address}")
-    logger.info(f"🔍 special_tone: {special_tone}")
-    
     if special_name:
-        logger.info(f"👑 Особый пользователь: {special_name} (ID: {user_id})")
+        logger.info(f"👑 Особый пользователь: {special_name}")
     else:
-        logger.info(f"👤 Обычный пользователь: {user_id}")
-    
-    logger.info(f"📝 Персонализированный промпт: {personalized_prompt[:200]}...")
+        logger.info(f"👤 Пользователь {user_id}")
 
     # Сохраняем сообщение пользователя в историю
     history_manager.add_message(chat_id, "user", clean_text)
@@ -364,10 +413,24 @@ async def handle_message(message: Dict):
     )
     
     # Для Любови добавляем обращение в начало ответа, если его там нет
-    if user_preferences.get_special_name(user_id) == "Любовь":
-        if not response.lower().startswith("моя королева"):
+    special_name = user_preferences.get_special_name(user_id)
+    
+    if special_name == "Любовь":
+        # Проверяем, есть ли уже обращение "моя королева" в тексте
+        if "моя королева" not in response.lower():
             response = f"Моя королева, {response}"
             logger.info(f"👑 Добавлено обращение для Любови")
+        else:
+            logger.info(f"👑 Обращение уже присутствует в ответе")
+    
+    # Для Титомира добавляем обращение в начало ответа, если его там нет
+    if special_name == "Титомир":
+        # Проверяем, есть ли уже обращение "неопытный менестрель" в тексте
+        if "неопытный менестрель" not in response.lower():
+            response = f"Неопытный менестрель, {response}"
+            logger.info(f"🎭 Добавлено обращение для Титомира")
+        else:
+            logger.info(f"🎭 Обращение уже присутствует в ответе")
 
     # Сохраняем ответ в историю
     history_manager.add_message(chat_id, "assistant", response)
@@ -394,12 +457,11 @@ async def main():
             }
         ) as response:
             data = await response.json()
-            logger.info(f"VK API Response: {data}")
             if "response" in data and "groups" in data["response"] and data["response"]["groups"]:
                 group = data["response"]["groups"][0]
                 logger.info(f"✅ Подключение к ВКонтакте: '{group.get('name', 'Сота Сил')}'")
             else:
-                logger.error(f"❌ Ошибка подключения к VK: {data}")
+                logger.error(f"❌ Ошибка подключения к VK")
                 return
 
     # Проверка подключения к GigaChat

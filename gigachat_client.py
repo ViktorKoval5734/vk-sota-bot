@@ -52,14 +52,10 @@ class GigaChatClient:
                         data = await response.json()
                         self.access_token = data.get('access_token')
                         if self.access_token:
-                            print("Access Token получен успешно")
                             return True
                     else:
-                        error_text = await response.text()
-                        print(f"Ошибка получения Access Token: {response.status}, {error_text}")
                         return False
         except Exception as e:
-            print(f"Ошибка при получении Access Token: {e}")
             return False
         return False
 
@@ -108,7 +104,7 @@ class GigaChatClient:
                 payload = {
                     "model": self.model,
                     "messages": messages,
-                    "temperature": 0.35,  # Низкое значение для максимальной точности
+                    "temperature": 0.4,  # Слегка повышена для большей вариативности
                     "max_tokens": MAX_TOKENS
                 }
 
@@ -127,8 +123,6 @@ class GigaChatClient:
 
                         return assistant_message
                     else:
-                        error_text = await response.text()
-                        print(f"Ошибка GigaChat API: {response.status}, {error_text}")
                         # Попробуем получить новый токен
                         if response.status == 401:
                             self.access_token = None
@@ -137,7 +131,6 @@ class GigaChatClient:
                         return "Механизмы пока молчат... Попробуй позже."
 
         except Exception as e:
-            print(f"Ошибка при запросе к GigaChat: {e}")
             return "Что-то сломалось в моих механизмах... Попробуй позже."
 
     async def chat(self, user_message: str, chat_id: str) -> str:
@@ -179,7 +172,7 @@ class GigaChatClient:
                 payload = {
                     "model": self.model,
                     "messages": messages,
-                    "temperature": 0.35,  # Низкое значение для максимальной точности
+                    "temperature": 0.4,  # Слегка повышена для большей вариативности
                     "max_tokens": MAX_TOKENS
                 }
 
@@ -198,8 +191,6 @@ class GigaChatClient:
 
                         return assistant_message
                     else:
-                        error_text = await response.text()
-                        print(f"Ошибка GigaChat API: {response.status}, {error_text}")
                         # Попробуем получить новый токен
                         if response.status == 401:
                             self.access_token = None
@@ -208,7 +199,6 @@ class GigaChatClient:
                         return "Механизмы пока молчат... Попробуй позже."
 
         except Exception as e:
-            print(f"Ошибка при запросе к GigaChat: {e}")
             return "Что-то сломалось в моих механизмах... Попробуй позже."
 
     async def test_connection(self) -> bool:

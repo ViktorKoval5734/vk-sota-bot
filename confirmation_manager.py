@@ -24,7 +24,6 @@ class ConfirmationManager:
         # Если код есть в конфигурации, используем его
         if VK_CONFIRMATION_CODE:
             self.expected_code = VK_CONFIRMATION_CODE
-            logger.info(f"📋 Код подтверждения из конфигурации: {VK_CONFIRMATION_CODE}")
     
     def load_code(self) -> Optional[str]:
         """Загружает код подтверждения из файла"""
