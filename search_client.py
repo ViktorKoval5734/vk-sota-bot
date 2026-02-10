@@ -16,13 +16,13 @@ class SerperClient:
         self.api_url = "https://google.serper.dev/search"
         self.api_key = SERPER_API_KEY
 
-    async def search(self, query: str, num_results: int = 1) -> Optional[Dict]:
+    async def search(self, query: str, num_results: int = 3) -> Optional[Dict]:
         """
         Выполнение поиска по запросу
 
         Args:
             query: Поисковый запрос
-            num_results: Количество результатов (по умолчанию 1)
+            num_results: Количество результатов (по умолчанию 3)
 
         Returns:
             Словарь с результатами поиска или None при ошибке
@@ -79,13 +79,11 @@ class SerperClient:
 
         # Берём только первый результат (наиболее релевантный)
         result = results[0]
-        title = result.get("title", "Без названия")
         snippet = result.get("snippet", "Нет описания")
         link = result.get("link", "")
 
-        formatted = f"{snippet}\n\n🔗 Источник: {link}"
-
-        return formatted
+        # Возвращаем только сниппет и ссылку (без форматирования)
+        return f"{snippet}|||{link}"
 
 
 # Глобальный экземпляр клиента
