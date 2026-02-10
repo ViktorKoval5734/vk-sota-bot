@@ -16,13 +16,13 @@ class SerperClient:
         self.api_url = "https://google.serper.dev/search"
         self.api_key = SERPER_API_KEY
 
-    async def search(self, query: str, num_results: int = 5) -> Optional[Dict]:
+    async def search(self, query: str, num_results: int = 1) -> Optional[Dict]:
         """
         Выполнение поиска по запросу
 
         Args:
             query: Поисковый запрос
-            num_results: Количество результатов (по умолчанию 5)
+            num_results: Количество результатов (по умолчанию 1)
 
         Returns:
             Словарь с результатами поиска или None при ошибке
@@ -77,19 +77,15 @@ class SerperClient:
         if not results:
             return "Магия псиджиков не нашла ничего подходящего..."
 
-        formatted = ""
-        for i, result in enumerate(results[:5], 1):
-            title = result.get("title", "Без названия")
-            snippet = result.get("snippet", "Нет описания")
-            link = result.get("link", "")
+        # Берём только первый результат (наиболее релевантный)
+        result = results[0]
+        title = result.get("title", "Без названия")
+        snippet = result.get("snippet", "Нет описания")
+        link = result.get("link", "")
 
-            formatted += f"\n📌 {title}\n"
-            formatted += f"{snippet}\n"
-            formatted += f"🔗 {link}\n"
-            if i < len(results[:5]):
-                formatted += "\n"
+        formatted = f"{snippet}\n\n🔗 Источник: {link}"
 
-        return formatted.strip()
+        return formatted
 
 
 # Глобальный экземпляр клиента
