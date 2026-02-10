@@ -17,6 +17,7 @@ import uvicorn
 
 from config import VK_TOKEN, VK_GROUP_ID, VK_API_URL, VK_API_VERSION, CONFIRMATION_SECRET, SYSTEM_PROMPT
 from gigachat_client import gigachat_client
+from search_client import serper_client
 from history import history_manager
 from user_preferences import user_preferences
 from confirmation_manager import confirmation_manager
@@ -155,6 +156,66 @@ def check_secret_secret_type(event: Dict) -> bool:
         json.dumps(event).encode(),
         hashlib.sha256
     ).hexdigest() == event["secret"]
+
+
+def is_search_request(text: str) -> bool:
+    """
+    Проверка, является ли сообщение поисковым запросом
+
+    Args:
+        text: Текст сообщения
+
+    Returns:
+        True если нужно выполнить поиск в интернете
+    """
+    search_keywords = [
+        "найди", "найди в сети", "разузнай", "узнай", "проверь",
+        "найди информацию", "поищи", "гугл", "google", "поиск",
+        "что такое", "кто такой", "кто такая", "как работает",
+        "какая", "какой", "какое", "какие", "сколько", "где находится",
+        "история", "сведения", "информация о", "опиши", "расскажи о"
+    ]
+
+    text_lower = text.lower().strip()
+    for keyword in search_keywords:
+        if keyword in text_lower:
+            logger.info(f"🔍 Обнаружен поисковый запрос: {keyword}")
+            return True
+
+    return False
+
+
+def extract_search_query(text: str) -> str:
+    """
+    Извлечение поискового запроса из текста
+
+    Args:
+        text: Текст сообщения
+
+    Returns:
+        Очищенный поисковый запрос
+    """
+    # Убираем ключевые слова поиска
+    search_prefixes = [
+        "найди", "найди в сети", "разузнай", "узнай", "проверь",
+        "найди информацию", "поищи", "гугл", "google", "поиск",
+        "что такое", "кто такой", "кто такая", "как работает",
+        "история", "сведения", "информация о", "опиши", "расскажи о"
+    ]
+
+    query = text.lower().strip()
+    for prefix in sorted(search_prefixes, key=len, reverse=True):
+        if query.startswith(prefix):
+            query = query[len(prefix):].strip()
+            # Убираем возможные слова после префикса
+            query = query.lstrip(": ,.!?-")
+            break
+
+    # Если запрос пустой, возвращаем оригинальный текст
+    if not query:
+        return text
+
+    return query
 
 
 @app.get("/update_confirmation/{new_code}")
@@ -362,6 +423,32 @@ async def handle_message(message: Dict):
     user_name = await get_user_name(user_id)
 
     logger.info(f"📝 Сообщение от {user_name}: {clean_text}")
+
+    # Проверяем, является ли это поисковым запросом
+    if is_search_request(clean_text):
+        logger.info(f"🔍 Выполняем поиск в интернете...")
+        search_query = extract_search_query(clean_text)
+        logger.info(f"🔍 Поисковый запрос: {search_query}")
+
+        # Выполняем поиск через Serper
+        search_data = await serper_client.search(search_query)
+
+        if search_data:
+            # Форматируем результаты
+            formatted_results = serper_client.format_results(search_data)
+            # Добавляем ролевой префикс
+            response = f"Магия псиджиков нашла ответ на твой вопрос:\n\n{formatted_results}"
+            logger.info(f"✅ Поиск выполнен успешно")
+        else:
+            response = "Магия псиджиков не смогла найти ничего... Возможно, механизмы поиска временно недоступны."
+            logger.info(f"❌ Поиск не удался")
+
+        # Сохраняем ответ в историю
+        history_manager.add_message(chat_id, "assistant", response)
+
+        # Отправляем ответ в беседу
+        await send_message(user_id, message.get("peer_id"), response)
+        return
 
     # Проверяем команды настройки (только при упоминании)
     setup_response = user_preferences.parse_setup_command(user_id, clean_text)

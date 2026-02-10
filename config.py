@@ -27,6 +27,9 @@ GIGACHAT_CLIENT_ID = os.getenv("GIGACHAT_CLIENT_ID")
 # Scope для Гигачата
 GIGACHAT_SCOPE = os.getenv("GIGACHAT_SCOPE", "GIGACHAT_API_PERS")
 
+# API ключ Serper для поиска в интернете
+SERPER_API_KEY = os.getenv("SERPER_API_KEY", "97cdaf0bee3dc916cc7816b990eec2c202f1e3c8")
+
 # URL сервера ВКонтакте для Callback API
 VK_API_URL = "https://api.vk.com/method/"
 
